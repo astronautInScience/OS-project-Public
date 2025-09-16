@@ -1,0 +1,495 @@
+#include <iostream>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/param.h>
+#include <signal.h>
+#include <string.h>
+#include <assert.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <vector>
+#include <list>
+#include <optional>
+#include <algorithm>
+#include <sstream>
+#include <memory>
+
+using namespace std;
+
+struct Command {
+    vector<string> parts = {};
+    
+    bool empty() const { return parts.empty(); }
+    const string& program() const { 
+        static const string empty_str = "";
+        return parts.empty() ? empty_str : parts[0]; 
+    }
+};
+
+struct Expression {
+    vector<Command> commands;
+    string inputFromFile;
+    string outputToFile;
+    bool background = false;
+    bool appendOutput = false; // Support for >> operator
+};
+
+// Enhanced string splitting with proper whitespace handling and quote support
+vector<string> split_string(const string& str, char delimiter = ' ') {
+    vector<string> result;
+    string current;
+    bool in_quotes = false;
+    bool escape_next = false;
+    
+    for (char c : str) {
+        if (escape_next) {
+            current += c;
+            escape_next = false;
+        } else if (c == '\\') {
+            escape_next = true;
+        } else if (c == '"' && !escape_next) {
+            in_quotes = !in_quotes;
+        } else if (c == delimiter && !in_quotes) {
+            if (!current.empty()) {
+                result.push_back(current);
+                current.clear();
+            }
+        } else {
+            current += c;
+        }
+    }
+    
+    if (!current.empty()) {
+        result.push_back(current);
+    }
+    
+    return result;
+}
+
+// Improved execvp wrapper with better error handling
+int execvp_wrapper(const vector<string>& args) {
+    if (args.empty()) {
+        errno = EINVAL;
+        return -1;
+    }
+    
+    // Build argument list
+    auto c_args = make_unique<const char*[]>(args.size() + 1);
+    for (size_t i = 0; i < args.size(); ++i) {
+        c_args[i] = args[i].c_str();
+    }
+    c_args[args.size()] = nullptr;
+    
+    // Replace current process
+    int rc = ::execvp(c_args[0], const_cast<char**>(c_args.get()));
+    return rc; // Only reached on failure
+}
+
+// Execute a single command
+int execute_command(const Command& cmd) {
+    if (cmd.empty()) {
+        errno = EINVAL;
+        return -1;
+    }
+    
+    return execvp_wrapper(cmd.parts);
+}
+
+// Enhanced prompt with error handling
+void display_prompt() {
+    char buffer[PATH_MAX];
+    char* dir = getcwd(buffer, sizeof(buffer));
+    if (dir) {
+        cout << "\e[32m" << dir << "\e[39m";
+    } else {
+        cout << "\e[32m[unknown]\e[39m"; // Fallback if getcwd fails
+    }
+    cout << "$ ";
+    cout.flush();
+}
+
+string request_command_line(bool showPrompt) {
+    if (showPrompt) {
+        display_prompt();
+    }
+    string retval;
+    getline(cin, retval);
+    return retval;
+}
+
+// Enhanced parser with better operator handling
+Expression parse_command_line(const string& commandLine) {
+    Expression expression;
+    
+    // Handle empty input
+    if (commandLine.empty() || commandLine.find_first_not_of(" \t\n") == string::npos) {
+        return expression;
+    }
+    
+    // Split by pipes
+    vector<string> commands = split_string(commandLine, '|');
+    
+    for (size_t i = 0; i < commands.size(); ++i) {
+        string line = commands[i];
+        
+        // Trim whitespace
+        line.erase(0, line.find_first_not_of(" \t"));
+        line.erase(line.find_last_not_of(" \t") + 1);
+        
+        if (line.empty()) continue;
+        
+        vector<string> args = split_string(line, ' ');
+        if (args.empty()) continue;
+        
+        // Handle background execution (only on last command)
+        if (i == commands.size() - 1) {
+            auto it = find(args.begin(), args.end(), "&");
+            if (it != args.end()) {
+                expression.background = true;
+                args.erase(it);
+            }
+        }
+        
+        // Handle output redirection (only on last command)
+        if (i == commands.size() - 1) {
+            for (auto it = args.begin(); it != args.end(); ++it) {
+                if (*it == ">>" && it + 1 != args.end()) {
+                    expression.outputToFile = *(it + 1);
+                    expression.appendOutput = true;
+                    args.erase(it, it + 2);
+                    break;
+                } else if (*it == ">" && it + 1 != args.end()) {
+                    expression.outputToFile = *(it + 1);
+                    expression.appendOutput = false;
+                    args.erase(it, it + 2);
+                    break;
+                }
+            }
+        }
+        
+        // Handle input redirection (only on first command)
+        if (i == 0) {
+            for (auto it = args.begin(); it != args.end(); ++it) {
+                if (*it == "<" && it + 1 != args.end()) {
+                    expression.inputFromFile = *(it + 1);
+                    args.erase(it, it + 2);
+                    break;
+                }
+            }
+        }
+        
+        if (!args.empty()) {
+            expression.commands.push_back({args});
+        }
+    }
+    
+    return expression;
+}
+
+// Enhanced signal handling for background processes
+void setup_signal_handlers() {
+    // Prevent shell from being killed by Ctrl+C when background processes are running
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+}
+
+// Reap zombie processes
+void reap_children() {
+    int status;
+    while (waitpid(-1, &status, WNOHANG) > 0) {
+        // Reaped a child process
+    }
+}
+
+int execute_expression(Expression& expression) {
+    // Return if there is nothing to do
+    if (expression.commands.empty()) {
+        return 0; // Changed from EINVAL to 0 for empty commands
+    }
+
+    // Handle built-in commands
+    const Command &firstCmd = expression.commands[0];
+    if (!firstCmd.empty()) {
+        const string &cmdName = firstCmd.program();
+        
+        if (cmdName == "exit") {
+            int code = 0;
+            if (firstCmd.parts.size() > 1) {
+                try {
+                    code = stoi(firstCmd.parts[1]);
+                } catch (const exception &) {
+                    cerr << "exit: numeric argument required" << endl;
+                    return 1;
+                }
+            }
+            cout.flush();
+            cerr.flush();
+            _exit(code);
+        } 
+        else if (cmdName == "cd") {
+            const char *path = nullptr;
+            if (firstCmd.parts.size() >= 2) {
+                path = firstCmd.parts[1].c_str();
+            } else {
+                path = getenv("HOME");
+                if (!path) path = "/";
+            }
+            if (chdir(path) != 0) {
+                perror("cd");
+                return errno;
+            }
+            return 0;
+        }
+        else if (cmdName == "pwd") {
+            char buffer[PATH_MAX];
+            if (getcwd(buffer, sizeof(buffer))) {
+                cout << buffer << endl;
+            } else {
+                perror("pwd");
+                return errno;
+            }
+            return 0;
+        }
+    }
+
+    // Execute external commands
+    size_t n = expression.commands.size();
+    vector<array<int, 2>> pipes(n > 1 ? n - 1 : 0);
+    vector<pid_t> pids(n);
+
+    // Create pipes
+    for (size_t i = 0; i + 1 < n; ++i) {
+        if (pipe(pipes[i].data()) == -1) {
+            perror("pipe");
+            // Clean up any pipes created so far
+            for (size_t j = 0; j < i; ++j) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            return errno;
+        }
+    }
+
+    // Fork and execute each command
+    for (size_t i = 0; i < n; ++i) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            // Clean up pipes and kill any children already started
+            for (size_t j = 0; j + 1 < n; ++j) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            for (size_t j = 0; j < i; ++j) {
+                kill(pids[j], SIGTERM);
+            }
+            return errno;
+        }
+        
+        if (pid == 0) {
+            // Child process - reset signal handlers
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            
+            // Set up input redirection
+            if (i > 0) {
+                if (dup2(pipes[i - 1][0], STDIN_FILENO) == -1) {
+                    perror("dup2");
+                    _exit(errno);
+                }
+            } else if (!expression.inputFromFile.empty()) {
+                int fd = open(expression.inputFromFile.c_str(), O_RDONLY);
+                if (fd == -1) {
+                    perror(expression.inputFromFile.c_str());
+                    _exit(errno);
+                }
+                if (dup2(fd, STDIN_FILENO) == -1) {
+                    perror("dup2");
+                    close(fd);
+                    _exit(errno);
+                }
+                close(fd);
+            }
+            
+            // Set up output redirection
+            if (i + 1 < n) {
+                if (dup2(pipes[i][1], STDOUT_FILENO) == -1) {
+                    perror("dup2");
+                    _exit(errno);
+                }
+            } else if (!expression.outputToFile.empty()) {
+                int flags = O_WRONLY | O_CREAT;
+                if (expression.appendOutput) {
+                    flags |= O_APPEND;
+                } else {
+                    flags |= O_TRUNC;
+                }
+                int fd = open(expression.outputToFile.c_str(), flags, 0644);
+                if (fd == -1) {
+                    perror(expression.outputToFile.c_str());
+                    _exit(errno);
+                }
+                if (dup2(fd, STDOUT_FILENO) == -1) {
+                    perror("dup2");
+                    close(fd);
+                    _exit(errno);
+                }
+                close(fd);
+            }
+            
+            // Close all pipe file descriptors
+            for (size_t j = 0; j + 1 < n; ++j) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            
+            // Execute the command
+            if (execute_command(expression.commands[i]) == -1) {
+                perror(expression.commands[i].program().c_str());
+                _exit(errno);
+            }
+            _exit(0); // Should never reach here
+        } else {
+            // Parent process
+            pids[i] = pid;
+        }
+    }
+
+    // Close pipe file descriptors in parent
+    for (size_t i = 0; i + 1 < n; ++i) {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+
+    // Wait for children or run in background
+    int last_status = 0;
+    if (!expression.background) {
+        for (size_t i = 0; i < n; ++i) {
+            int status;
+            if (waitpid(pids[i], &status, 0) == -1) {
+                perror("waitpid");
+            } else if (i == n - 1) { // Save exit status of last command
+                last_status = WEXITSTATUS(status);
+            }
+        }
+    } else {
+        cout << "[Background job started with PID";
+        for (pid_t pid : pids) {
+            cout << " " << pid;
+        }
+        cout << "]" << endl;
+    }
+    
+    return last_status;
+}
+
+// Completed step1 function for pipeline example
+int step1(bool showPrompt) {
+    // Create pipe for communication
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        return errno;
+    }
+
+    // Fork first child for "date"
+    pid_t child1 = fork();
+    if (child1 == -1) {
+        perror("fork");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return errno;
+    }
+    
+    if (child1 == 0) {
+        // Child 1: redirect stdout to pipe write end
+        close(pipefd[0]); // Close read end
+        if (dup2(pipefd[1], STDOUT_FILENO) == -1) {
+            perror("dup2");
+            _exit(errno);
+        }
+        close(pipefd[1]); // Close after duplication
+        
+        Command cmd = {{"date"}};
+        if (execute_command(cmd) == -1) {
+            perror("date");
+            _exit(errno);
+        }
+        _exit(0); // Should not reach here
+    }
+
+    // Fork second child for "tail -c 5"
+    pid_t child2 = fork();
+    if (child2 == -1) {
+        perror("fork");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        kill(child1, SIGTERM); // Clean up first child
+        return errno;
+    }
+    
+    if (child2 == 0) {
+        // Child 2: redirect stdin from pipe read end
+        close(pipefd[1]); // Close write end
+        if (dup2(pipefd[0], STDIN_FILENO) == -1) {
+            perror("dup2");
+            _exit(errno);
+        }
+        close(pipefd[0]); // Close after duplication
+        
+        Command cmd = {{"tail", "-c", "5"}};
+        if (execute_command(cmd) == -1) {
+            perror("tail");
+            _exit(errno);
+        }
+        _exit(0); // Should not reach here
+    }
+
+    // Parent: close pipe ends and wait for children
+    close(pipefd[0]);
+    close(pipefd[1]);
+    
+    int status1, status2;
+    waitpid(child1, &status1, 0);
+    waitpid(child2, &status2, 0);
+    
+    return 0;
+}
+
+int shell(bool showPrompt) {
+    // Set up signal handling
+    setup_signal_handlers();
+    
+    while (cin.good()) {
+        // Reap any zombie processes
+        reap_children();
+        
+        string commandLine = request_command_line(showPrompt);
+        if (!cin.good()) break;
+        
+        // Skip empty lines
+        if (commandLine.empty() || commandLine.find_first_not_of(" \t\n") == string::npos) {
+            continue;
+        }
+        
+        Expression expression = parse_command_line(commandLine);
+        int rc = execute_expression(expression);
+        
+        // Only show error for non-zero exit codes that aren't from normal command failures
+        if (rc != 0 && showPrompt) {
+            // Don't show system errors for command exit codes
+        }
+    }
+    
+    return 0;
+}
+
+// Optional: Add main function for completeness
+int main(int argc, char* argv[]) {
+    bool showPrompt = isatty(STDIN_FILENO);
+    return shell(showPrompt);
+}
